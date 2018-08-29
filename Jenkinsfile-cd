@@ -1,0 +1,138 @@
+pipeline {
+    agent none
+    options {
+        disableConcurrentBuilds()
+    }
+    stages {
+        stage('Prepare') {
+            steps {
+                node('default') {
+                    // Checkout the branch that caused this build to trigger
+                    checkout scm
+                    stash name: 'source', useDefaultExcludes: false, includes: '**,**/.*', allowEmpty: true
+                    cleanWs externalDelete: 'rm -fr %s'
+                }
+            }
+        }
+        stage('Tests') {
+            parallel {
+                stage('Linting') {
+                    steps {
+                        node('small') {
+                            unstash 'source'
+                            sh '''
+                                  virtualenv venv
+                                  source venv/bin/activate
+                                  pip install flake8
+                                  flake8 --ignore=E501 hello_world/
+                            '''
+                            cleanWs externalDelete: 'rm -fr %s'
+                        }
+                    }
+                }
+                stage('Security') {
+                    steps {
+                        node('small') {
+                            unstash 'source'
+                            sh '''
+                                  virtualenv venv
+                                  source venv/bin/activate
+                                  pip install safety
+                                  safety check -r requirements.txt
+                            '''
+                            cleanWs externalDelete: 'rm -fr %s'
+                        }
+                    }
+                }
+                stage('Unit Tests') {
+                    steps {
+                        node('small') {
+                            unstash 'source'
+                            sh '''
+                                  virtualenv venv
+                                  source venv/bin/activate
+                                  pip install pytest pytest-cov
+                                  pip install -r requirements.txt
+                            '''
+                            sh '''
+                                  source venv/bin/activate
+                                  pytest --cov hello_world --cov-report html --cov-fail-under 100 tests/ -v
+                            '''                                      
+                            stash includes: '**/htmlcov/**', name: 'coverage'
+                            cleanWs externalDelete: 'rm -fr %s'
+                        }
+                    }
+                }
+            }
+        }
+        stage('Stage Deploy') {
+            steps {
+                node('small') {
+                    unstash 'source' 
+                    sh 'pip install --user aws-sam-cli'
+                    sh 'pip install --isolated --disable-pip-version-check -Ur requirements.txt -t hello_world/build/'
+                    sh '''rsync -av --exclude='__pycache__/' --exclude='build/' hello_world/* hello_world/build/'''
+                    sh 'PATH=/home/ec2-user/.local/bin:$PATH sam package --template-file template.yaml --s3-bucket patientpop-lambda --output-template-file packaged-template.yaml'
+                    sh 'PATH=/home/ec2-user/.local/bin:$PATH sam deploy --template-file packaged-template.yaml --stack-name SAMPythonHelloWorldCD --capabilities CAPABILITY_IAM'
+                    cleanWs externalDelete: 'rm -fr %s'
+                }
+            }
+        }
+        stage('Stage Automation Testing') {
+            steps {
+                node('small') {
+                    sh 'echo "[*] Do some automation Testing here"'
+                }
+            }
+        }
+        stage('Prod Deploy') {
+            steps {
+                node('small') {
+                    sh '''set +x 
+                          echo "[*] Starting Canary Deplyoment"
+                          STACK_OUTPUT=`aws cloudformation describe-stacks --stack-name SAMPythonHelloWorldCD --query Stacks[0].Outputs`
+                          FUNCTION_NAME=`python3 -c "print([value['OutputValue'] for value in ${STACK_OUTPUT} if value['OutputKey'] == 'FunctionName'][0])"`
+                          CREATE_NEW_VERSION=`aws lambda publish-version --function-name $FUNCTION_NAME`
+                          VERSION_NUMBER=`python3 -c "print(${CREATE_NEW_VERSION}['Version'])"`
+                          STATE_MACHINE_ARN=`aws cloudformation describe-stack-resources --stack-name aws-lambda-deploy-stack --logical-resource-id DeployStateMachine --output text | cut  -d$'\t' -f3`
+                          EXECUTION=`aws stepfunctions start-execution --state-machine-arn $STATE_MACHINE_ARN --input '{"function-name": "'$FUNCTION_NAME'",
+                                                                                                             "alias-name": "prod",
+                                                                                                             "new-version": "'$VERSION_NUMBER'",
+                                                                                                             "steps": 10,
+                                                                                                             "interval": 120,
+                                                                                                             "type": "linear"}'`
+                         EXECUTION_ARN=`python3 -c "print(${EXECUTION}['executionArn'])"`
+                         STATUS="RUNNING"
+                         while [ "$STATUS" == "RUNNING" ]; do 
+                             echo Status: $STATUS 
+                             sleep 60
+                             EXECUTION_RAW=`aws stepfunctions describe-execution --execution-arn $EXECUTION_ARN`
+                             STATUS=`python3 -c "print(${EXECUTION_RAW}['status'])"`
+                         done
+                         if [ $STATUS != "SUCCEEDED" ]; then
+                             echo $RESULT
+                             echo "[*] Deployment Failed"
+                             exit 1
+                         fi
+                         echo "[*] Canary Deplyoment Complete"
+                    '''
+                    cleanWs externalDelete: 'rm -fr %s'
+                }
+            }
+        }
+    }
+    post {
+        always {
+            node('default') {
+                unstash 'coverage'
+                publishHTML([allowMissing: true,
+                             alwaysLinkToLastBuild: true,
+                             keepAll: true,
+                             reportDir: '',
+                             reportFiles: '**/htmlcov/**',
+                             reportName: 'Coverage Report',
+                             reportTitles: ''])
+            }
+        }
+    }
+}

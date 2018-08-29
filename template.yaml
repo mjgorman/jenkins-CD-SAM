@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+    AWS Sam, Lambda, Python, Jenkins CI/CD
+    
+    A skeleton hellow world project
+
+####################
+# Globals Settings #
+#################### 
+Globals:
+    Function:
+        Timeout: 5
+
+Resources:
+  ############################
+  # Lambda Related resources #
+  ############################
+  MyTestFunction:
+    Type: "AWS::Serverless::Function"
+    FunctionName: MyTestFunction
+    Properties:
+      CodeUri: hello_world/build/
+      Handler: app.lambda_handler
+      Runtime: python3.6
+
+  StagingAlias: 
+    Type: AWS::Lambda::Alias
+    Properties: 
+      FunctionName: !Ref MyTestFunction 
+      FunctionVersion: $LATEST 
+      Name: staging
+
+  ProdAlias: 
+    Type: AWS::Lambda::Alias
+    Properties: 
+      FunctionName: !Ref MyTestFunction 
+      FunctionVersion: "1"
+      Name: prod
+    DependsOn: 
+      - InitialVersion
+
+  InitialVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref MyTestFunction
+      Description: "Initital Version"
+
+  StagingLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub ${MyTestFunction.Arn}:staging 
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyApiGW}/*/GET/*
+    DependsOn: 
+      - StagingAlias
+
+  ProdLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub ${MyTestFunction.Arn}:prod
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyApiGW}/*/GET/*
+    DependsOn: 
+      - ProdAlias
+
+  #########################
+  # API Gateway Resources #                                                                                 
+  #########################
+
+  MyApiGW: 
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Description: "My API Gateway"
+      Name: "MyApiGW"
+
+  MyResource: 
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      RestApiId: !Ref MyApiGW
+      ParentId: 
+        Fn::GetAtt: 
+          - MyApiGW
+          - RootResourceId
+      PathPart: "{proxy+}"
+
+  MyTestFunctionAPIMethod:
+    Type: "AWS::ApiGateway::Method"
+    DependsOn: 
+      - MyTestFunction
+    Properties:
+      RestApiId: !Ref MyApiGW
+      ResourceId: !Ref MyResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyTestFunction.Arn}:${!stageVariables.lambdaAlias}/invocations
+
+  Staging:
+    Type: 'AWS::ApiGateway::Stage'
+    DependsOn: MyApiGW
+    Properties:
+      StageName: staging
+      Description: API Staging
+      RestApiId: !Ref MyApiGW
+      DeploymentId: !Ref StagingDeployment
+      Variables:
+        lambdaAlias: staging
+  
+  StagingDeployment: 
+    DependsOn: 
+      - MyTestFunctionAPIMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties: 
+      RestApiId: !Ref MyApiGW
+  
+  Prod:
+    Type: 'AWS::ApiGateway::Stage'
+    DependsOn: MyApiGW
+    Properties:
+      StageName: prod
+      Description: API Production
+      RestApiId: !Ref MyApiGW
+      DeploymentId: !Ref StagingDeployment
+      Variables:
+        lambdaAlias: prod
+
+  ProdDeployment: 
+    DependsOn: 
+      - MyTestFunctionAPIMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties: 
+      RestApiId: !Ref MyApiGW
+
+#####################################
+# Outputs from cloudformation stack #
+#####################################
+Outputs:
+  FunctionName:
+    Description: FunctionName
+    Value: !Ref MyTestFunction
